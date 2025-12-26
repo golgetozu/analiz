@@ -9,6 +9,9 @@ import statsmodels.formula.api as smf
 from scipy import stats
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder
+st.set_page_config(page_title="Oto Sigorta Analiz", page_icon="🚗", layout="wide")
+
+st.title("🚗 Oto Branşı Analiz Sistemi - Aktüeryal Modül")
 
 # ==================== ŞİFRE KORUMASI ====================
 def check_password():
@@ -52,9 +55,6 @@ def check_password():
 if not check_password():
     st.stop()
 # ==================== ŞİFRE KORUMASI BİTTİ ====================
-st.set_page_config(page_title="Oto Sigorta Analiz", page_icon="🚗", layout="wide")
-
-st.title("🚗 Oto Branşı Analiz Sistemi - Aktüeryal Modül")
 
 # Dosya Yükleme
 st.sidebar.header("📂 Veri Yükle")
