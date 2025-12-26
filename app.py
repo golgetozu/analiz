@@ -72,7 +72,7 @@ st.sidebar.header("📂 Veri Yükle")
 uretim_file = st.sidebar.file_uploader("Üretim Verisi", type=['xlsx', 'xls'])
 hasar_file = st.sidebar.file_uploader("Hasar Verisi", type=['xlsx', 'xls'])
 
-@st.cache_data
+@st.cache_data(ttl=3600)
 def load_excel(file):
     if file:
         df = pd.read_excel(file)
