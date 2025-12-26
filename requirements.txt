@@ -1,5 +1,9 @@
 streamlit
 pandas
+numpy
 plotly
 openpyxl
 xlrd
+statsmodels
+scikit-learn
+scipy
