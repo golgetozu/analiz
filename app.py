@@ -5,11 +5,6 @@ import pandas as pd
 import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
-from datetime import datetime
-import statsmodels.api as sm
-from scipy import stats
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import LabelEncoder
 
 # ==================== ŞİFRE KORUMASI ====================
 def check_password():
@@ -37,19 +32,20 @@ if not check_password():
     st.stop()
 # ==================== ŞİFRE KORUMASI BİTTİ ====================
 
-st.title("🚗 Oto Branşı Analiz Sistemi - Aktüeryal Modül")
+st.title("🚗 Oto Branşı Hasar/Prim Analiz Sistemi")
 
 # Dosya Yükleme
 st.sidebar.header("📂 Veri Yükle")
-uretim_file = st.sidebar.file_uploader("Üretim Verisi", type=['xlsx', 'xls', 'xlsb'])
-hasar_file = st.sidebar.file_uploader("Hasar Verisi", type=['xlsx', 'xls', 'xlsb'])
+hasar_file = st.sidebar.file_uploader("Hasar/Prim Verisi", type=['xlsx', 'xls', 'xlsb'])
 
-@st.cache_data(ttl=3600)
+@st.cache_data(ttl=7200, show_spinner="Veri yükleniyor...")
 def load_excel(file):
     if file:
         try:
             df = pd.read_excel(file)
-            date_cols = ['P Tanzim Tarihi', 'P Baş.Tarih', 'P Bit. Tarihi']
+            # Tarih sütunlarını düzelt
+            date_cols = ['POLICE_BASLANGIC_TARIHI', 'POLICE_BITIS_TARIHI', 'ZEYIL_ONAY_TARIHI', 
+                        'IPTAL_TARIHI', 'TAZMINAT_ODEME_TARIH', 'TAZMINAT_MAX_ODEME_TARIH', 'HASAR_TARIHI']
             for col in date_cols:
                 if col in df.columns:
                     df[col] = pd.to_datetime(df[col], errors='coerce')
@@ -59,482 +55,655 @@ def load_excel(file):
             return None
     return None
 
-df_uretim_raw = load_excel(uretim_file)
-df_hasar_raw = load_excel(hasar_file)
+df_raw = load_excel(hasar_file)
 
-tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
-    "📊 Özet", "🏭 Üretim", "💥 Hasar", "📈 H/P Oranı", 
-    "🔬 GLM Analizi", "📉 Aktüeryal", "🎯 Risk Skorlama"
+# Ana hesaplama fonksiyonu
+@st.cache_data(ttl=7200)
+def hesapla_metrikler(df):
+    """Tüm temel metrikleri hesapla ve cache'le"""
+    
+    # Net Hasar = Tazminat + Masraf - Rücu - Sovtaj
+    df['NET_HASAR'] = (
+        df['TAZMINAT_TOPLAM_ODEME_TUTAR'].fillna(0) + 
+        df['MASRAF_TOPLAM_ODEME_TUTAR'].fillna(0) - 
+        df['RUCU_TOPLAM_ODEME_TUTAR'].fillna(0) - 
+        df['SOVTAJ_TOPLAM_ODEME_TUTAR'].fillna(0)
+    )
+    
+    # Muallak dahil hasar
+    df['TOPLAM_HASAR_MUALLAK'] = (
+        df['NET_HASAR'] + 
+        df['TAZMINAT_TOPLAM_MUALLAK_TUTAR'].fillna(0) + 
+        df['MASRAF_TOPLAM_MUALLAK_TUTAR'].fillna(0) - 
+        df['RUCU_TOPLAM_MUALLAK_TUTAR'].fillna(0) - 
+        df['SOVTAJ_TOPLAM_MUALLAK_TUTAR'].fillna(0)
+    )
+    
+    # Hasar/Prim oranı
+    df['HP_ORANI'] = np.where(
+        df['TOPLAM_KAZANILMIS_PRIM'] > 0,
+        df['NET_HASAR'] / df['TOPLAM_KAZANILMIS_PRIM'] * 100,
+        0
+    )
+    
+    # Sürücü yaş grubu
+    df['YAS_GRUBU'] = pd.cut(
+        df['SURUCU_YASI'].fillna(35),
+        bins=[0, 25, 35, 45, 55, 65, 100],
+        labels=['18-25', '26-35', '36-45', '46-55', '56-65', '65+']
+    )
+    
+    # Model yaş grubu
+    current_year = pd.Timestamp.now().year
+    df['ARAC_YASI'] = current_year - df['MODEL_YILI'].fillna(current_year - 5)
+    df['ARAC_YAS_GRUBU'] = pd.cut(
+        df['ARAC_YASI'],
+        bins=[-1, 2, 5, 10, 15, 50],
+        labels=['0-2 yaş', '3-5 yaş', '6-10 yaş', '11-15 yaş', '15+ yaş']
+    )
+    
+    return df
+
+# Segment analizi fonksiyonu
+@st.cache_data(ttl=7200)
+def segment_analizi(df, grup_kolonu):
+    """Herhangi bir kolona göre segment analizi yap"""
+    
+    analiz = df.groupby(grup_kolonu).agg({
+        'TOPLAM_KAZANILMIS_PRIM': 'sum',
+        'NET_HASAR': 'sum',
+        'TOPLAM_HASAR_MUALLAK': 'sum',
+        'TOPLAM_IHBAR_ADET': 'sum',
+        'KAZANILMIS_ADET': 'sum',
+        'POLICE_NO': 'count'
+    }).reset_index()
+    
+    analiz.columns = [grup_kolonu, 'Kazanılmış Prim', 'Net Hasar', 'Hasar+Muallak', 
+                      'İhbar Adet', 'Kazanılmış Adet', 'Poliçe Sayısı']
+    
+    # H/P Oranı
+    analiz['H/P Oranı (%)'] = np.where(
+        analiz['Kazanılmış Prim'] > 0,
+        (analiz['Net Hasar'] / analiz['Kazanılmış Prim'] * 100).round(1),
+        0
+    )
+    
+    # Hasar Frekansı
+    analiz['Hasar Frekansı (%)'] = np.where(
+        analiz['Kazanılmış Adet'] > 0,
+        (analiz['İhbar Adet'] / analiz['Kazanılmış Adet'] * 100).round(2),
+        0
+    )
+    
+    # Ortalama Hasar
+    analiz['Ort. Hasar'] = np.where(
+        analiz['İhbar Adet'] > 0,
+        (analiz['Net Hasar'] / analiz['İhbar Adet']).round(0),
+        0
+    )
+    
+    # Kar/Zarar
+    analiz['Kar/Zarar'] = analiz['Kazanılmış Prim'] - analiz['Net Hasar']
+    
+    # Durum belirleme
+    def durum_belirle(hp):
+        if hp < 50:
+            return '🟢 Karlı'
+        elif hp < 70:
+            return '🟡 Dikkat'
+        elif hp < 100:
+            return '🟠 Riskli'
+        else:
+            return '🔴 Zararlı'
+    
+    analiz['Durum'] = analiz['H/P Oranı (%)'].apply(durum_belirle)
+    
+    return analiz.sort_values('H/P Oranı (%)', ascending=False)
+
+# Sekmeler
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+    "📊 Özet Dashboard", 
+    "🔍 Segment Analizi", 
+    "🗺️ Bölgesel Analiz",
+    "👤 Sürücü Profili",
+    "🚗 Araç Analizi",
+    "📈 Trend & Tahmin"
 ])
 
-# TAB 1: ÖZET
+# ==================== TAB 1: ÖZET DASHBOARD ====================
 with tab1:
-    if df_uretim_raw is not None:
-        df_uretim = df_uretim_raw.copy()
+    if df_raw is not None:
+        df = hesapla_metrikler(df_raw.copy())
         
+        st.subheader("📊 Genel Performans Özeti")
+        
+        # Ana metrikler
+        col1, col2, col3, col4, col5 = st.columns(5)
+        
+        toplam_prim = df['TOPLAM_KAZANILMIS_PRIM'].sum()
+        toplam_hasar = df['NET_HASAR'].sum()
+        toplam_muallak = df['TOPLAM_HASAR_MUALLAK'].sum()
+        genel_hp = (toplam_hasar / toplam_prim * 100) if toplam_prim > 0 else 0
+        
+        with col1:
+            st.metric("Kazanılmış Prim", f"₺{toplam_prim:,.0f}")
+        with col2:
+            st.metric("Net Hasar", f"₺{toplam_hasar:,.0f}")
+        with col3:
+            st.metric("Hasar + Muallak", f"₺{toplam_muallak:,.0f}")
+        with col4:
+            delta_color = "inverse" if genel_hp > 70 else "normal"
+            st.metric("H/P Oranı", f"%{genel_hp:.1f}", delta=f"{'Riskli' if genel_hp > 70 else 'Normal'}", delta_color=delta_color)
+        with col5:
+            kar_zarar = toplam_prim - toplam_hasar
+            st.metric("Kar/Zarar", f"₺{kar_zarar:,.0f}")
+        
+        # İkinci satır metrikler
         col1, col2, col3, col4 = st.columns(4)
         
         with col1:
-            st.metric("Toplam Poliçe", f"{len(df_uretim):,}")
+            st.metric("Toplam Poliçe", f"{len(df):,}")
         with col2:
-            st.metric("Toplam Brüt Prim", f"₺{df_uretim['P Brüt Prim'].sum():,.0f}")
+            st.metric("Toplam İhbar", f"{df['TOPLAM_IHBAR_ADET'].sum():,.0f}")
         with col3:
-            st.metric("Toplam Net Prim", f"₺{df_uretim['P Net Prim'].sum():,.0f}")
+            frekans = (df['TOPLAM_IHBAR_ADET'].sum() / df['KAZANILMIS_ADET'].sum() * 100) if df['KAZANILMIS_ADET'].sum() > 0 else 0
+            st.metric("Hasar Frekansı", f"%{frekans:.2f}")
         with col4:
-            st.metric("Ortalama Prim", f"₺{df_uretim['P Brüt Prim'].mean():,.0f}")
+            ort_hasar = toplam_hasar / df['TOPLAM_IHBAR_ADET'].sum() if df['TOPLAM_IHBAR_ADET'].sum() > 0 else 0
+            st.metric("Ort. Hasar Tutarı", f"₺{ort_hasar:,.0f}")
         
-        st.subheader("📊 Özet İstatistikler")
+        st.markdown("---")
+        
+        # Hızlı Görselleştirmeler
         col1, col2 = st.columns(2)
         
         with col1:
-            kullanim = df_uretim.groupby('KULLANIM ŞEKLİ')['P Brüt Prim'].sum()
-            fig = px.pie(values=kullanim.values, names=kullanim.index, 
-                        title="Kullanım Şekli Dağılımı", hole=0.4)
+            st.subheader("🔴 En Zararlı 10 Segment")
+            # Bölge bazlı hızlı analiz
+            bolge_analiz = segment_analizi(df, 'BOLGE_AD')
+            zararli = bolge_analiz[bolge_analiz['H/P Oranı (%)'] > 70].head(10)
+            
+            if len(zararli) > 0:
+                fig = px.bar(zararli, x='BOLGE_AD', y='H/P Oranı (%)', 
+                           color='H/P Oranı (%)',
+                           color_continuous_scale=['green', 'yellow', 'red'],
+                           title="Bölge Bazlı H/P Oranı (Zararlı Olanlar)")
+                fig.add_hline(y=70, line_dash="dash", line_color="red")
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.success("Tüm bölgeler karlı!")
+        
+        with col2:
+            st.subheader("🟢 En Karlı 10 Segment")
+            karli = bolge_analiz[bolge_analiz['H/P Oranı (%)'] < 50].head(10)
+            
+            if len(karli) > 0:
+                fig = px.bar(karli.sort_values('H/P Oranı (%)'), x='BOLGE_AD', y='H/P Oranı (%)',
+                           color='H/P Oranı (%)',
+                           color_continuous_scale=['green', 'yellow', 'red'],
+                           title="Bölge Bazlı H/P Oranı (Karlı Olanlar)")
+                fig.add_hline(y=50, line_dash="dash", line_color="green")
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.warning("50% altında bölge yok")
+        
+        # Hasar dağılımı
+        st.subheader("📊 Hasar Tipi Dağılımı")
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            hasar_tipleri = pd.DataFrame({
+                'Hasar Tipi': ['Maddi', 'Bedeni', 'Değer Kaybı', 'Diğer'],
+                'Tutar': [
+                    df['TAZMINAT_MADDI_ODEME_TUTAR'].sum(),
+                    df['TAZMINAT_BEDENI_ODEME_TUTAR'].sum(),
+                    df['TAZMINAT_DEGER_KAYBI_ODEME_TUTAR'].sum(),
+                    df['TAZMINAT_DIGER_ODEME_TUTAR'].sum()
+                ]
+            })
+            fig = px.pie(hasar_tipleri, values='Tutar', names='Hasar Tipi', 
+                        title="Hasar Tipi Dağılımı", hole=0.4)
             st.plotly_chart(fig, use_container_width=True)
         
         with col2:
-            il_uretim = df_uretim.groupby('U Sig. İl')['P Brüt Prim'].sum().nlargest(10)
-            fig2 = px.bar(x=il_uretim.index, y=il_uretim.values, 
-                         title="Top 10 İl - Prim Üretimi")
-            st.plotly_chart(fig2, use_container_width=True)
-    else:
-        st.info("👈 Sol panelden üretim Excel dosyanızı yükleyin")
-
-# TAB 2: ÜRETİM
-with tab2:
-    if df_uretim_raw is not None:
-        df_uretim = df_uretim_raw.copy()
-        
-        st.subheader("🏭 Üretim Analizi")
-        
-        analiz_tip = st.selectbox("Analiz Tipi", [
-            "Kaynak Performansı", "İl Bazlı", "Aylık Trend", 
-            "Marka Dağılımı", "Dijital vs Geleneksel"
-        ])
-        
-        if analiz_tip == "Kaynak Performansı":
-            kaynak = df_uretim.groupby('P Kaynak Adı').agg({
-                'P Brüt Prim': 'sum',
-                'Poliçe No': 'count'
-            }).sort_values('P Brüt Prim', ascending=False).head(15)
-            
-            fig = px.bar(kaynak, y='P Brüt Prim', title="Top 15 Kaynak")
-            st.plotly_chart(fig, use_container_width=True)
-        
-        elif analiz_tip == "İl Bazlı":
-            il_analiz = df_uretim.groupby('U Sig. İl').agg({
-                'P Brüt Prim': ['sum', 'mean'],
-                'Poliçe No': 'count'
-            }).round(0)
-            il_analiz.columns = ['Toplam Prim', 'Ortalama Prim', 'Poliçe Sayısı']
-            il_analiz = il_analiz.sort_values('Toplam Prim', ascending=False)
-            
-            fig = px.bar(il_analiz.head(20).reset_index(), x='U Sig. İl', y='Toplam Prim',
-                        title="İl Bazlı Prim Dağılımı (Top 20)")
-            st.plotly_chart(fig, use_container_width=True)
-            st.dataframe(il_analiz.head(20))
-        
-        elif analiz_tip == "Aylık Trend":
-            df_uretim['Ay'] = pd.to_datetime(df_uretim['P Tanzim Tarihi']).dt.to_period('M')
-            aylik = df_uretim.groupby('Ay').agg({
-                'P Brüt Prim': 'sum',
-                'Poliçe No': 'count'
+            ihbar_tipleri = pd.DataFrame({
+                'İhbar Tipi': ['Maddi', 'Bedeni', 'Değer Kaybı', 'Diğer'],
+                'Adet': [
+                    df['MADDI_IHBAR_ADET'].sum(),
+                    df['BEDENI_IHBAR_ADET'].sum(),
+                    df['DEGER_KAYBI_IHBAR_ADET'].sum(),
+                    df['DIGER_IHBAR_ADET'].sum()
+                ]
             })
-            
-            fig = go.Figure()
-            fig.add_trace(go.Scatter(x=aylik.index.astype(str), y=aylik['P Brüt Prim'],
-                                    mode='lines+markers', name='Prim',
-                                    line=dict(color='blue', width=3)))
-            fig.update_layout(title="Aylık Üretim Trendi", 
-                            xaxis_title="Ay", yaxis_title="Brüt Prim")
+            fig = px.pie(ihbar_tipleri, values='Adet', names='İhbar Tipi',
+                        title="İhbar Tipi Dağılımı", hole=0.4)
             st.plotly_chart(fig, use_container_width=True)
-        
-        elif analiz_tip == "Marka Dağılımı":
-            marka = df_uretim.groupby('MARKA').agg({
-                'P Brüt Prim': 'sum',
-                'Poliçe No': 'count'
-            }).sort_values('P Brüt Prim', ascending=False).head(15)
             
+    else:
+        st.info("👈 Sol panelden hasar/prim Excel dosyanızı yükleyin")
+
+# ==================== TAB 2: SEGMENT ANALİZİ ====================
+with tab2:
+    if df_raw is not None:
+        df = hesapla_metrikler(df_raw.copy())
+        
+        st.subheader("🔍 Detaylı Segment Analizi")
+        
+        # Analiz boyutu seçimi
+        analiz_secenekleri = {
+            'Bölge': 'BOLGE_AD',
+            'Acente': 'ACENTE_AD',
+            'İl (Sigortalı)': 'SIG_IL_KODU',
+            'İl (Plaka)': 'PLAKA_IL',
+            'Kullanım Tarzı': 'KULLANIM_TARZI',
+            'Marka': 'MARKA',
+            'Basamak': 'BASAMAK_KODU',
+            'Ürün': 'URUN_ADI',
+            'Sürücü Yaş Grubu': 'YAS_GRUBU',
+            'Araç Yaş Grubu': 'ARAC_YAS_GRUBU',
+            'Medeni Durum': 'MEDENI_DURUM',
+            'Cinsiyet': 'CINSIYET',
+            'Özel/Tüzel': 'OZEL_TUZEL',
+            'Yakıt Tipi': 'YAKIT_TIPI',
+            'Havuz Durumu': 'HAVUZ_DURUM',
+            'Model Yılı': 'MODEL_YILI'
+        }
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            secilen_boyut = st.selectbox("Analiz Boyutu Seçin", list(analiz_secenekleri.keys()))
+        with col2:
+            min_police = st.number_input("Minimum Poliçe Sayısı", min_value=1, value=10)
+        
+        kolon = analiz_secenekleri[secilen_boyut]
+        
+        if kolon in df.columns:
+            analiz = segment_analizi(df, kolon)
+            analiz = analiz[analiz['Poliçe Sayısı'] >= min_police]
+            
+            # Özet metrikler
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                zararli_sayisi = len(analiz[analiz['H/P Oranı (%)'] > 100])
+                st.metric("🔴 Zararlı Segment", zararli_sayisi)
+            with col2:
+                riskli_sayisi = len(analiz[(analiz['H/P Oranı (%)'] > 70) & (analiz['H/P Oranı (%)'] <= 100)])
+                st.metric("🟠 Riskli Segment", riskli_sayisi)
+            with col3:
+                dikkat_sayisi = len(analiz[(analiz['H/P Oranı (%)'] > 50) & (analiz['H/P Oranı (%)'] <= 70)])
+                st.metric("🟡 Dikkat Segment", dikkat_sayisi)
+            with col4:
+                karli_sayisi = len(analiz[analiz['H/P Oranı (%)'] <= 50])
+                st.metric("🟢 Karlı Segment", karli_sayisi)
+            
+            # Görselleştirme
+            st.subheader(f"📊 {secilen_boyut} Bazlı H/P Analizi")
+            
+            # Top 20 göster
+            analiz_top = analiz.head(20)
+            
+            fig = px.bar(analiz_top, x=kolon, y='H/P Oranı (%)',
+                        color='H/P Oranı (%)',
+                        color_continuous_scale=['green', 'yellow', 'orange', 'red'],
+                        hover_data=['Kazanılmış Prim', 'Net Hasar', 'Kar/Zarar', 'Poliçe Sayısı'],
+                        title=f"{secilen_boyut} Bazlı H/P Oranı (En Yüksek 20)")
+            fig.add_hline(y=70, line_dash="dash", line_color="red", annotation_text="Risk Eşiği %70")
+            fig.add_hline(y=100, line_dash="dash", line_color="darkred", annotation_text="Zarar Eşiği %100")
+            st.plotly_chart(fig, use_container_width=True)
+            
+            # Detaylı tablo
+            st.subheader("📋 Detaylı Tablo")
+            
+            # Filtreleme
             col1, col2 = st.columns(2)
             with col1:
-                fig = px.bar(marka, y='P Brüt Prim', title="Top 15 Marka - Prim")
-                st.plotly_chart(fig, use_container_width=True)
-            with col2:
-                fig2 = px.pie(values=marka['Poliçe No'][:10].values, 
-                             names=marka.index[:10],
-                             title="Top 10 Marka - Poliçe Sayısı")
-                st.plotly_chart(fig2, use_container_width=True)
-        
-        elif analiz_tip == "Dijital vs Geleneksel":
-            col1, col2, col3 = st.columns(3)
+                durum_filtre = st.multiselect("Durum Filtresi", 
+                    ['🔴 Zararlı', '🟠 Riskli', '🟡 Dikkat', '🟢 Karlı'],
+                    default=['🔴 Zararlı', '🟠 Riskli'])
             
-            dijital_prim = df_uretim[df_uretim['DİJİTAL Mİ ? ( E / H )'] == 'E']['P Brüt Prim'].sum()
-            geleneksel_prim = df_uretim[df_uretim['DİJİTAL Mİ ? ( E / H )'] == 'H']['P Brüt Prim'].sum()
+            if durum_filtre:
+                analiz_filtered = analiz[analiz['Durum'].isin(durum_filtre)]
+            else:
+                analiz_filtered = analiz
+            
+            # Format
+            format_dict = {
+                'Kazanılmış Prim': '₺{:,.0f}',
+                'Net Hasar': '₺{:,.0f}',
+                'Hasar+Muallak': '₺{:,.0f}',
+                'Kar/Zarar': '₺{:,.0f}',
+                'Ort. Hasar': '₺{:,.0f}',
+                'H/P Oranı (%)': '{:.1f}%',
+                'Hasar Frekansı (%)': '{:.2f}%'
+            }
+            
+            st.dataframe(analiz_filtered.style.format(format_dict), use_container_width=True)
+            
+            # Öneri kutusu
+            st.subheader("💡 Stratejik Öneriler")
+            
+            zararli_segmentler = analiz[analiz['H/P Oranı (%)'] > 100]
+            karli_segmentler = analiz[analiz['H/P Oranı (%)'] < 50]
+            
+            col1, col2 = st.columns(2)
             
             with col1:
-                st.metric("Dijital Kanallar", f"₺{dijital_prim:,.0f}")
+                st.error("🔴 **PRİM ARTIŞI ÖNERİLEN SEGMENTLER**")
+                if len(zararli_segmentler) > 0:
+                    for _, row in zararli_segmentler.head(5).iterrows():
+                        st.write(f"• **{row[kolon]}**: H/P %{row['H/P Oranı (%)']:.0f} - Zarar: ₺{abs(row['Kar/Zarar']):,.0f}")
+                else:
+                    st.write("Zararlı segment yok")
+            
             with col2:
-                st.metric("Geleneksel Kanallar", f"₺{geleneksel_prim:,.0f}")
-            with col3:
-                toplam = dijital_prim + geleneksel_prim
-                if toplam > 0:
-                    dijital_oran = (dijital_prim / toplam * 100)
-                    st.metric("Dijital Oran", f"%{dijital_oran:.1f}")
-    else:
-        st.info("👈 Sol panelden üretim Excel dosyanızı yükleyin")
-
-# TAB 3: HASAR
-with tab3:
-    if df_hasar_raw is not None:
-        st.subheader("💥 Hasar Analizi")
-        st.dataframe(df_hasar_raw.head())
-    else:
-        st.warning("Hasar verisi yüklenmedi")
-
-# TAB 4: H/P ORANI
-with tab4:
-    if df_uretim_raw is not None:
-        st.subheader("📈 Hasar/Prim Oranı")
-        st.info("Hasar verisi yüklendiğinde H/P oranı hesaplanacak")
+                st.success("🟢 **İNDİRİM UYGULANABİLECEK SEGMENTLER**")
+                if len(karli_segmentler) > 0:
+                    for _, row in karli_segmentler.head(5).iterrows():
+                        st.write(f"• **{row[kolon]}**: H/P %{row['H/P Oranı (%)']:.0f} - Kar: ₺{row['Kar/Zarar']:,.0f}")
+                else:
+                    st.write("Çok karlı segment yok")
+        else:
+            st.warning(f"'{kolon}' sütunu verilerinizde bulunamadı")
     else:
         st.info("👈 Sol panelden veri yükleyin")
 
-# TAB 5: GLM ANALİZİ
-with tab5:
-    if df_uretim_raw is not None:
-        st.header("🔬 GLM (Generalized Linear Model) Analizi")
+# ==================== TAB 3: BÖLGESEL ANALİZ ====================
+with tab3:
+    if df_raw is not None:
+        df = hesapla_metrikler(df_raw.copy())
         
-        st.markdown("""
-        ### GLM ile Prim Tahmini
-        Aktüeryal fiyatlamada kullanılan GLM modelini verilerinize uyguluyoruz.
-        """)
-        
-        model_data = df_uretim_raw.copy()
-        
-        le_il = LabelEncoder()
-        le_marka = LabelEncoder()
-        le_kullanim = LabelEncoder()
-        
-        model_data['il_encoded'] = le_il.fit_transform(model_data['U Sig. İl'].fillna('Bilinmeyen').astype(str))
-        model_data['marka_encoded'] = le_marka.fit_transform(model_data['MARKA'].fillna('Diğer').astype(str))
-        model_data['kullanim_encoded'] = le_kullanim.fit_transform(model_data['KULLANIM ŞEKLİ'].fillna('Diğer').astype(str))
+        st.subheader("🗺️ Bölgesel Performans Analizi")
         
         col1, col2 = st.columns(2)
         
         with col1:
-            model_type = st.selectbox("Model Tipi", [
-                "Gamma GLM (Pure Premium)",
-                "Poisson GLM (Frequency)",
-                "Tweedie GLM (Aggregate Loss)"
-            ])
+            il_tipi = st.radio("İl Bazı", ["Sigortalı İli (SIG_IL_KODU)", "Plaka İli (PLAKA_IL)"])
         
-        with col2:
-            target_col = st.selectbox("Hedef Değişken", ['P Net Prim', 'P Brüt Prim'])
+        il_kolon = 'SIG_IL_KODU' if 'Sigortalı' in il_tipi else 'PLAKA_IL'
         
-        st.subheader("Model Değişkenleri")
-        
-        degiskenler = st.multiselect(
-            "Modele eklenecek değişkenler",
-            ['il_encoded', 'marka_encoded', 'kullanim_encoded', 'MODEL YILI', 'BASAMAK'],
-            default=['il_encoded', 'marka_encoded', 'MODEL YILI']
-        )
-        
-        if st.button("🚀 GLM Modelini Çalıştır", type="primary"):
-            try:
-                model_df = model_data[degiskenler + [target_col]].dropna()
-                
-                # Sıfır ve negatif değerleri filtrele (Gamma için gerekli)
-                model_df = model_df[model_df[target_col] > 0]
-                
-                if len(model_df) < 100:
-                    st.error("Yeterli veri yok. En az 100 satır gerekli.")
-                else:
-                    X = model_df[degiskenler]
-                    y = model_df[target_col]
-                    
-                    X_train, X_test, y_train, y_test = train_test_split(
-                        X, y, test_size=0.2, random_state=42
-                    )
-                    
-                    if model_type == "Gamma GLM (Pure Premium)":
-                        glm_model = sm.GLM(y_train, sm.add_constant(X_train), 
-                                          family=sm.families.Gamma(link=sm.families.links.Log()))
-                    elif model_type == "Poisson GLM (Frequency)":
-                        glm_model = sm.GLM(y_train, sm.add_constant(X_train), 
-                                          family=sm.families.Poisson())
-                    else:
-                        glm_model = sm.GLM(y_train, sm.add_constant(X_train), 
-                                          family=sm.families.Tweedie(var_power=1.5))
-                    
-                    glm_results = glm_model.fit()
-                    
-                    st.success("✅ Model başarıyla oluşturuldu!")
-                    
-                    col1, col2, col3 = st.columns(3)
-                    
-                    with col1:
-                        st.metric("AIC", f"{glm_results.aic:.0f}")
-                    with col2:
-                        st.metric("BIC", f"{glm_results.bic:.0f}")
-                    with col3:
-                        st.metric("Log-Likelihood", f"{glm_results.llf:.0f}")
-                    
-                    st.subheader("📊 Model Katsayıları")
-                    
-                    coef_df = pd.DataFrame({
-                        'Değişken': glm_results.params.index,
-                        'Katsayı': glm_results.params.values,
-                        'Std Hata': glm_results.bse.values,
-                        'P-değeri': glm_results.pvalues.values
-                    })
-                    
-                    st.dataframe(coef_df)
-                    
-                    st.subheader("🎯 Model Performansı")
-                    
-                    y_pred = glm_results.predict(sm.add_constant(X_test))
-                    
-                    mse = np.mean((y_test - y_pred) ** 2)
-                    rmse = np.sqrt(mse)
-                    mae = np.mean(np.abs(y_test - y_pred))
-                    
-                    col1, col2, col3 = st.columns(3)
-                    with col1:
-                        st.metric("RMSE", f"{rmse:,.0f}")
-                    with col2:
-                        st.metric("MAE", f"{mae:,.0f}")
-                    with col3:
-                        ss_res = np.sum((y_test - y_pred) ** 2)
-                        ss_tot = np.sum((y_test - y_test.mean()) ** 2)
-                        r2 = 1 - (ss_res / ss_tot) if ss_tot > 0 else 0
-                        st.metric("R²", f"{r2:.3f}")
-                    
-                    fig = px.scatter(x=y_test, y=y_pred, 
-                                   title="Gerçek vs Tahmin Değerleri",
-                                   labels={'x': 'Gerçek Prim', 'y': 'Tahmin Prim'})
-                    fig.add_trace(go.Scatter(x=[y_test.min(), y_test.max()], 
-                                            y=[y_test.min(), y_test.max()],
-                                            mode='lines', name='İdeal Çizgi',
-                                            line=dict(color='red', dash='dash')))
-                    st.plotly_chart(fig, use_container_width=True)
-                    
-                    st.subheader("📈 Değişken Önem Sıralaması")
-                    
-                    importance_df = pd.DataFrame({
-                        'Değişken': coef_df['Değişken'][1:],
-                        'Önem': np.abs(coef_df['Katsayı'][1:].values)
-                    }).sort_values('Önem', ascending=False)
-                    
-                    fig2 = px.bar(importance_df, x='Önem', y='Değişken', 
-                                 orientation='h', title="Değişken Önem Skorları")
-                    st.plotly_chart(fig2, use_container_width=True)
-                    
-            except Exception as e:
-                st.error(f"Model hatası: {e}")
-    else:
-        st.info("👈 Sol panelden üretim Excel dosyanızı yükleyin")
-
-# TAB 6: AKTÜERYAL ANALİZ
-with tab6:
-    if df_uretim_raw is not None:
-        df_uretim = df_uretim_raw.copy()
-        
-        st.header("📉 Aktüeryal Analizler")
-        
-        aktueryal_tip = st.selectbox("Analiz Tipi", [
-            "Loss Development (Hasar Gelişimi)",
-            "Frequency-Severity Analizi",
-            "Pure Premium Hesaplama",
-            "Credibility Analizi",
-            "Risk Gruplaması"
-        ])
-        
-        if aktueryal_tip == "Pure Premium Hesaplama":
-            st.subheader("💰 Pure Premium (Saf Prim) Hesaplama")
+        if il_kolon in df.columns:
+            il_analiz = segment_analizi(df, il_kolon)
             
-            grup_degisken = st.selectbox("Gruplama Değişkeni", 
-                                        ['U Sig. İl', 'MARKA', 'KULLANIM ŞEKLİ', 'MODEL YILI'])
+            # Harita yerine bar chart (Türkiye haritası için ek kütüphane gerekir)
+            st.subheader("📊 İl Bazlı H/P Oranı")
             
-            pure_premium = df_uretim.groupby(grup_degisken).agg({
-                'P Net Prim': ['sum', 'mean', 'count']
-            })
-            pure_premium.columns = ['Toplam Prim', 'Ortalama Prim', 'Poliçe Sayısı']
+            col1, col2 = st.columns(2)
             
-            pure_premium['Risk Skoru'] = (pure_premium['Ortalama Prim'] / 
-                                         pure_premium['Ortalama Prim'].mean() * 100).round(0)
+            with col1:
+                st.write("**🔴 En Zararlı 15 İl**")
+                zararli_iller = il_analiz.head(15)
+                fig = px.bar(zararli_iller, x=il_kolon, y='H/P Oranı (%)',
+                           color='H/P Oranı (%)',
+                           color_continuous_scale=['yellow', 'orange', 'red'],
+                           hover_data=['Kazanılmış Prim', 'Net Hasar'])
+                fig.add_hline(y=70, line_dash="dash", line_color="red")
+                st.plotly_chart(fig, use_container_width=True)
             
-            st.dataframe(pure_premium)
+            with col2:
+                st.write("**🟢 En Karlı 15 İl**")
+                karli_iller = il_analiz.sort_values('H/P Oranı (%)').head(15)
+                fig = px.bar(karli_iller, x=il_kolon, y='H/P Oranı (%)',
+                           color='H/P Oranı (%)',
+                           color_continuous_scale=['green', 'yellow'],
+                           hover_data=['Kazanılmış Prim', 'Net Hasar'])
+                fig.add_hline(y=50, line_dash="dash", line_color="green")
+                st.plotly_chart(fig, use_container_width=True)
             
-            fig = px.treemap(pure_premium.reset_index(), 
-                           path=[grup_degisken], 
-                           values='Toplam Prim',
-                           color='Risk Skoru',
-                           color_continuous_scale='RdYlGn_r',
-                           title=f"{grup_degisken} Bazında Risk Haritası")
-            st.plotly_chart(fig, use_container_width=True)
-        
-        elif aktueryal_tip == "Frequency-Severity Analizi":
-            st.subheader("📊 Frequency-Severity Analizi")
-            
-            freq_data = df_uretim.groupby('U Sig. İl').agg({
-                'Poliçe No': 'count',
-                'P Net Prim': 'mean'
-            }).rename(columns={'Poliçe No': 'Frequency', 'P Net Prim': 'Severity'})
-            
-            fig = px.scatter(freq_data, x='Frequency', y='Severity',
-                           size='Frequency', hover_name=freq_data.index,
-                           title="Frequency vs Severity Matrisi",
-                           labels={'Frequency': 'Poliçe Sayısı (Frequency)',
-                                  'Severity': 'Ortalama Prim (Severity)'})
-            
-            fig.add_hline(y=freq_data['Severity'].median(), 
-                         line_dash="dash", line_color="gray")
-            fig.add_vline(x=freq_data['Frequency'].median(), 
-                         line_dash="dash", line_color="gray")
-            
-            st.plotly_chart(fig, use_container_width=True)
-            
-            st.markdown("""
-            ### 📍 Quadrant Analizi
-            - **Sağ Üst:** Yüksek Frequency, Yüksek Severity → Kritik segment
-            - **Sol Üst:** Düşük Frequency, Yüksek Severity → Büyük riskler
-            - **Sağ Alt:** Yüksek Frequency, Düşük Severity → Küçük riskler
-            - **Sol Alt:** Düşük Frequency, Düşük Severity → İdeal segment
-            """)
-        
-        elif aktueryal_tip == "Risk Gruplaması":
-            st.subheader("🎯 Risk Gruplaması ve Segmentasyon")
-            
-            df_uretim['Model_Risk'] = np.where(
-                df_uretim['MODEL YILI'] < 2015, 1.5,
-                np.where(df_uretim['MODEL YILI'] < 2020, 1.0, 0.8)
-            )
-            
-            df_uretim['Cinsiyet_Risk'] = np.where(
-                df_uretim['U Sig. Cinsiyet'] == 'E', 1.1, 1.0
-            )
-            
-            mean_prim = df_uretim['P Net Prim'].mean()
-            if mean_prim > 0:
-                df_uretim['Toplam_Risk'] = (
-                    df_uretim['Model_Risk'] * 
-                    df_uretim['Cinsiyet_Risk'] * 
-                    (df_uretim['P Net Prim'] / mean_prim)
-                )
+            # Bölge analizi
+            if 'BOLGE_AD' in df.columns:
+                st.subheader("📊 Bölge Bazlı Analiz")
+                bolge_analiz = segment_analizi(df, 'BOLGE_AD')
                 
-                df_uretim['Risk_Kategori'] = pd.cut(
-                    df_uretim['Toplam_Risk'],
-                    bins=[0, 0.8, 1.2, float('inf')],
-                    labels=['Düşük Risk', 'Orta Risk', 'Yüksek Risk']
-                )
-                
-                risk_dagilim = df_uretim['Risk_Kategori'].value_counts()
-                
-                col1, col2 = st.columns(2)
-                
-                with col1:
-                    fig = px.pie(values=risk_dagilim.values, 
-                               names=risk_dagilim.index,
-                               title="Risk Kategorisi Dağılımı")
-                    st.plotly_chart(fig, use_container_width=True)
-                
-                with col2:
-                    risk_prim = df_uretim.groupby('Risk_Kategori')['P Net Prim'].mean()
-                    fig2 = px.bar(x=risk_prim.index, y=risk_prim.values,
-                                title="Risk Kategorisine Göre Ortalama Prim")
-                    st.plotly_chart(fig2, use_container_width=True)
-        
-        elif aktueryal_tip == "Loss Development (Hasar Gelişimi)":
-            st.info("Bu analiz için hasar verisi gereklidir.")
-        
-        elif aktueryal_tip == "Credibility Analizi":
-            st.info("Credibility analizi yakında eklenecek.")
-    else:
-        st.info("👈 Sol panelden üretim Excel dosyanızı yükleyin")
-
-# TAB 7: RİSK SKORLAMA
-with tab7:
-    if df_uretim_raw is not None:
-        df_uretim = df_uretim_raw.copy()
-        
-        st.header("🎯 Otomatik Risk Skorlama Sistemi")
-        
-        st.markdown("""
-        ### Çok Değişkenli Risk Skorlama
-        Tüm faktörleri birlikte değerlendirerek her poliçe için risk skoru hesaplıyoruz.
-        """)
-        
-        st.subheader("⚙️ Skorlama Parametreleri")
-        
-        col1, col2, col3 = st.columns(3)
-        
-        with col1:
-            model_yili_agirlik = st.slider("Model Yılı Ağırlığı", 0.0, 2.0, 1.0)
-        
-        with col2:
-            il_agirlik = st.slider("İl Risk Ağırlığı", 0.0, 2.0, 1.0)
-        
-        with col3:
-            marka_agirlik = st.slider("Marka Ağırlığı", 0.0, 2.0, 1.0)
-        
-        if st.button("📊 Risk Skorlarını Hesapla", type="primary"):
-            try:
-                il_risk = df_uretim.groupby('U Sig. İl')['P Net Prim'].mean()
-                il_risk_norm = il_risk / il_risk.mean()
-                
-                marka_risk = df_uretim.groupby('MARKA')['P Net Prim'].mean()
-                marka_risk_norm = marka_risk / marka_risk.mean()
-                
-                df_uretim['model_yili_skor'] = (2024 - df_uretim['MODEL YILI'].fillna(2020)) / 10 * model_yili_agirlik
-                
-                df_uretim['il_skor'] = df_uretim['U Sig. İl'].map(il_risk_norm).fillna(1) * il_agirlik
-                
-                df_uretim['marka_skor'] = df_uretim['MARKA'].map(marka_risk_norm).fillna(1) * marka_agirlik
-                
-                df_uretim['risk_skoru'] = (
-                    df_uretim['model_yili_skor'].fillna(1) + 
-                    df_uretim['il_skor'].fillna(1) + 
-                    df_uretim['marka_skor'].fillna(1)
-                ) / 3 * 100
-                
-                st.success("✅ Risk skorları başarıyla hesaplandı!")
-                
-                fig = px.histogram(df_uretim, x='risk_skoru', nbins=50,
-                                title="Risk Skoru Dağılımı",
-                                labels={'risk_skoru': 'Risk Skoru', 'count': 'Poliçe Sayısı'})
-                fig.add_vline(x=100, line_dash="dash", line_color="red", 
-                             annotation_text="Ortalama Risk")
+                fig = px.treemap(bolge_analiz, path=['BOLGE_AD'], values='Kazanılmış Prim',
+                               color='H/P Oranı (%)',
+                               color_continuous_scale=['green', 'yellow', 'red'],
+                               title="Bölge Bazlı Prim ve H/P Oranı")
                 st.plotly_chart(fig, use_container_width=True)
                 
-                st.subheader("🔴 En Riskli Segmentler")
-                
-                gosterilecek_kolonlar = ['Poliçe No', 'U Sig. İl', 'MARKA', 'MODEL YILI', 'P Net Prim', 'risk_skoru']
-                mevcut_kolonlar = [k for k in gosterilecek_kolonlar if k in df_uretim.columns]
-                
-                riskli_segmentler = df_uretim.nlargest(10, 'risk_skoru')[mevcut_kolonlar]
-                st.dataframe(riskli_segmentler)
-                
-                st.subheader("💡 Risk Bazlı Fiyat Önerileri")
-                
-                df_uretim['onerilen_prim'] = df_uretim['P Net Prim'] * (df_uretim['risk_skoru'] / 100)
-                df_uretim['prim_farki'] = df_uretim['onerilen_prim'] - df_uretim['P Net Prim']
-                
-                ozet = pd.DataFrame({
-                    'Metrik': ['Mevcut Toplam Prim', 'Önerilen Toplam Prim', 'Potansiyel Gelir Artışı'],
-                    'Değer': [
-                        f"₺{df_uretim['P Net Prim'].sum():,.0f}",
-                        f"₺{df_uretim['onerilen_prim'].sum():,.0f}",
-                        f"₺{df_uretim['prim_farki'].sum():,.0f}"
-                    ]
-                })
-                
-                st.table(ozet)
-                
-            except Exception as e:
-                st.error(f"Hesaplama hatası: {e}")
+                st.dataframe(bolge_analiz, use_container_width=True)
     else:
-        st.info("👈 Sol panelden üretim Excel dosyanızı yükleyin")
+        st.info("👈 Sol panelden veri yükleyin")
+
+# ==================== TAB 4: SÜRÜCÜ PROFİLİ ====================
+with tab4:
+    if df_raw is not None:
+        df = hesapla_metrikler(df_raw.copy())
+        
+        st.subheader("👤 Sürücü Profili Analizi")
+        
+        col1, col2 = st.columns(2)
+        
+        # Yaş grubu analizi
+        with col1:
+            st.write("**📊 Yaş Grubu Analizi**")
+            if 'YAS_GRUBU' in df.columns:
+                yas_analiz = segment_analizi(df, 'YAS_GRUBU')
+                
+                fig = px.bar(yas_analiz, x='YAS_GRUBU', y='H/P Oranı (%)',
+                           color='H/P Oranı (%)',
+                           color_continuous_scale=['green', 'yellow', 'red'],
+                           title="Yaş Grubu Bazlı H/P Oranı")
+                fig.add_hline(y=70, line_dash="dash", line_color="red")
+                st.plotly_chart(fig, use_container_width=True)
+                
+                st.dataframe(yas_analiz, use_container_width=True)
+        
+        # Cinsiyet analizi
+        with col2:
+            st.write("**📊 Cinsiyet Analizi**")
+            if 'CINSIYET' in df.columns:
+                cinsiyet_analiz = segment_analizi(df, 'CINSIYET')
+                
+                fig = px.bar(cinsiyet_analiz, x='CINSIYET', y='H/P Oranı (%)',
+                           color='H/P Oranı (%)',
+                           color_continuous_scale=['green', 'yellow', 'red'],
+                           title="Cinsiyet Bazlı H/P Oranı")
+                st.plotly_chart(fig, use_container_width=True)
+                
+                st.dataframe(cinsiyet_analiz, use_container_width=True)
+        
+        # Medeni durum ve Özel/Tüzel
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.write("**📊 Medeni Durum Analizi**")
+            if 'MEDENI_DURUM' in df.columns:
+                medeni_analiz = segment_analizi(df, 'MEDENI_DURUM')
+                
+                fig = px.bar(medeni_analiz, x='MEDENI_DURUM', y='H/P Oranı (%)',
+                           color='H/P Oranı (%)',
+                           color_continuous_scale=['green', 'yellow', 'red'],
+                           title="Medeni Durum Bazlı H/P Oranı")
+                st.plotly_chart(fig, use_container_width=True)
+                
+                st.dataframe(medeni_analiz, use_container_width=True)
+        
+        with col2:
+            st.write("**📊 Özel/Tüzel Analizi**")
+            if 'OZEL_TUZEL' in df.columns:
+                ozel_tuzel_analiz = segment_analizi(df, 'OZEL_TUZEL')
+                
+                fig = px.bar(ozel_tuzel_analiz, x='OZEL_TUZEL', y='H/P Oranı (%)',
+                           color='H/P Oranı (%)',
+                           color_continuous_scale=['green', 'yellow', 'red'],
+                           title="Özel/Tüzel Bazlı H/P Oranı")
+                st.plotly_chart(fig, use_container_width=True)
+                
+                st.dataframe(ozel_tuzel_analiz, use_container_width=True)
+        
+        # Çapraz analiz
+        st.subheader("🔀 Çapraz Analiz")
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            capraz1 = st.selectbox("Birinci Boyut", ['CINSIYET', 'MEDENI_DURUM', 'OZEL_TUZEL', 'YAS_GRUBU'])
+        with col2:
+            capraz2 = st.selectbox("İkinci Boyut", ['YAS_GRUBU', 'CINSIYET', 'MEDENI_DURUM', 'OZEL_TUZEL'])
+        
+        if capraz1 in df.columns and capraz2 in df.columns:
+            capraz_analiz = df.groupby([capraz1, capraz2]).agg({
+                'TOPLAM_KAZANILMIS_PRIM': 'sum',
+                'NET_HASAR': 'sum'
+            }).reset_index()
+            
+            capraz_analiz['H/P Oranı'] = np.where(
+                capraz_analiz['TOPLAM_KAZANILMIS_PRIM'] > 0,
+                capraz_analiz['NET_HASAR'] / capraz_analiz['TOPLAM_KAZANILMIS_PRIM'] * 100,
+                0
+            )
+            
+            fig = px.density_heatmap(capraz_analiz, x=capraz1, y=capraz2, z='H/P Oranı',
+                                    color_continuous_scale=['green', 'yellow', 'red'],
+                                    title=f"{capraz1} vs {capraz2} - H/P Oranı Heatmap")
+            st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.info("👈 Sol panelden veri yükleyin")
+
+# ==================== TAB 5: ARAÇ ANALİZİ ====================
+with tab5:
+    if df_raw is not None:
+        df = hesapla_metrikler(df_raw.copy())
+        
+        st.subheader("🚗 Araç Bazlı Analiz")
+        
+        col1, col2 = st.columns(2)
+        
+        # Marka analizi
+        with col1:
+            st.write("**📊 Marka Analizi**")
+            if 'MARKA' in df.columns:
+                marka_analiz = segment_analizi(df, 'MARKA')
+                marka_analiz = marka_analiz[marka_analiz['Poliçe Sayısı'] >= 50]
+                
+                fig = px.bar(marka_analiz.head(20), x='MARKA', y='H/P Oranı (%)',
+                           color='H/P Oranı (%)',
+                           color_continuous_scale=['green', 'yellow', 'red'],
+                           title="Marka Bazlı H/P Oranı (Top 20)")
+                fig.add_hline(y=70, line_dash="dash", line_color="red")
+                st.plotly_chart(fig, use_container_width=True)
+        
+        # Araç yaşı analizi
+        with col2:
+            st.write("**📊 Araç Yaşı Analizi**")
+            if 'ARAC_YAS_GRUBU' in df.columns:
+                arac_yas_analiz = segment_analizi(df, 'ARAC_YAS_GRUBU')
+                
+                fig = px.bar(arac_yas_analiz, x='ARAC_YAS_GRUBU', y='H/P Oranı (%)',
+                           color='H/P Oranı (%)',
+                           color_continuous_scale=['green', 'yellow', 'red'],
+                           title="Araç Yaşı Bazlı H/P Oranı")
+                fig.add_hline(y=70, line_dash="dash", line_color="red")
+                st.plotly_chart(fig, use_container_width=True)
+        
+        # Kullanım tarzı ve Yakıt tipi
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.write("**📊 Kullanım Tarzı Analizi**")
+            if 'KULLANIM_TARZI' in df.columns:
+                kullanim_analiz = segment_analizi(df, 'KULLANIM_TARZI')
+                
+                fig = px.bar(kullanim_analiz, x='KULLANIM_TARZI', y='H/P Oranı (%)',
+                           color='H/P Oranı (%)',
+                           color_continuous_scale=['green', 'yellow', 'red'],
+                           title="Kullanım Tarzı Bazlı H/P Oranı")
+                st.plotly_chart(fig, use_container_width=True)
+                
+                st.dataframe(kullanim_analiz, use_container_width=True)
+        
+        with col2:
+            st.write("**📊 Yakıt Tipi Analizi**")
+            if 'YAKIT_TIPI' in df.columns:
+                yakit_analiz = segment_analizi(df, 'YAKIT_TIPI')
+                
+                fig = px.bar(yakit_analiz, x='YAKIT_TIPI', y='H/P Oranı (%)',
+                           color='H/P Oranı (%)',
+                           color_continuous_scale=['green', 'yellow', 'red'],
+                           title="Yakıt Tipi Bazlı H/P Oranı")
+                st.plotly_chart(fig, use_container_width=True)
+                
+                st.dataframe(yakit_analiz, use_container_width=True)
+        
+        # Basamak analizi
+        st.subheader("📊 Basamak Analizi")
+        if 'BASAMAK_KODU' in df.columns:
+            basamak_analiz = segment_analizi(df, 'BASAMAK_KODU')
+            
+            fig = px.line(basamak_analiz.sort_values('BASAMAK_KODU'), 
+                         x='BASAMAK_KODU', y='H/P Oranı (%)',
+                         markers=True,
+                         title="Basamak Bazlı H/P Oranı Trendi")
+            fig.add_hline(y=70, line_dash="dash", line_color="red")
+            st.plotly_chart(fig, use_container_width=True)
+            
+            st.dataframe(basamak_analiz, use_container_width=True)
+    else:
+        st.info("👈 Sol panelden veri yükleyin")
+
+# ==================== TAB 6: TREND & TAHMİN ====================
+with tab6:
+    if df_raw is not None:
+        df = hesapla_metrikler(df_raw.copy())
+        
+        st.subheader("📈 Trend Analizi")
+        
+        if 'POLICE_BASLANGIC_TARIHI' in df.columns:
+            df['AY'] = df['POLICE_BASLANGIC_TARIHI'].dt.to_period('M')
+            
+            aylik = df.groupby('AY').agg({
+                'TOPLAM_KAZANILMIS_PRIM': 'sum',
+                'NET_HASAR': 'sum',
+                'TOPLAM_IHBAR_ADET': 'sum',
+                'KAZANILMIS_ADET': 'sum'
+            }).reset_index()
+            
+            aylik['AY'] = aylik['AY'].astype(str)
+            aylik['H/P Oranı'] = np.where(
+                aylik['TOPLAM_KAZANILMIS_PRIM'] > 0,
+                aylik['NET_HASAR'] / aylik['TOPLAM_KAZANILMIS_PRIM'] * 100,
+                0
+            )
+            
+            # Trend grafiği
+            fig = go.Figure()
+            
+            fig.add_trace(go.Scatter(x=aylik['AY'], y=aylik['TOPLAM_KAZANILMIS_PRIM'],
+                                    mode='lines+markers', name='Kazanılmış Prim',
+                                    line=dict(color='blue', width=2)))
+            
+            fig.add_trace(go.Scatter(x=aylik['AY'], y=aylik['NET_HASAR'],
+                                    mode='lines+markers', name='Net Hasar',
+                                    line=dict(color='red', width=2)))
+            
+            fig.update_layout(title="Aylık Prim ve Hasar Trendi",
+                            xaxis_title="Ay", yaxis_title="Tutar (₺)")
+            st.plotly_chart(fig, use_container_width=True)
+            
+            # H/P oranı trendi
+            fig2 = go.Figure()
+            fig2.add_trace(go.Scatter(x=aylik['AY'], y=aylik['H/P Oranı'],
+                                     mode='lines+markers', name='H/P Oranı',
+                                     line=dict(color='purple', width=3)))
+            fig2.add_hline(y=70, line_dash="dash", line_color="red", annotation_text="Risk Eşiği")
+            fig2.update_layout(title="Aylık H/P Oranı Trendi",
+                             xaxis_title="Ay", yaxis_title="H/P Oranı (%)")
+            st.plotly_chart(fig2, use_container_width=True)
+            
+            st.dataframe(aylik, use_container_width=True)
+        
+        # UW Yılı analizi
+        st.subheader("📅 UW Yılı Bazlı Analiz")
+        if 'UW_YIL' in df.columns:
+            uw_analiz = segment_analizi(df, 'UW_YIL')
+            
+            fig = px.bar(uw_analiz, x='UW_YIL', y=['Kazanılmış Prim', 'Net Hasar'],
+                        barmode='group', title="UW Yılı Bazlı Prim vs Hasar")
+            st.plotly_chart(fig, use_container_width=True)
+            
+            st.dataframe(uw_analiz, use_container_width=True)
+    else:
+        st.info("👈 Sol panelden veri yükleyin")
 
 # Alt bilgi
 st.markdown("---")
-st.caption("Oto Branşı Analiz Sistemi - Aktüeryal Modül v2.0")
+st.caption("Oto Branşı Hasar/Prim Analiz Sistemi v3.0")
