@@ -122,9 +122,9 @@ with tab5:
         le_marka = LabelEncoder()
         le_kullanim = LabelEncoder()
         
-        model_data['il_encoded'] = le_il.fit_transform(model_data['U Sig. İl'].fillna('Bilinmeyen'))
-        model_data['marka_encoded'] = le_marka.fit_transform(model_data['MARKA'].fillna('Diğer'))
-        model_data['kullanim_encoded'] = le_kullanim.fit_transform(model_data['KULLANIM ŞEKLİ'].fillna('Diğer'))
+        model_data['il_encoded'] = le_il.fit_transform(model_data['U Sig. İl'].fillna('Bilinmeyen').astype(str))
+        model_data['marka_encoded'] = le_marka.fit_transform(model_data['MARKA'].fillna('Diğer').astype(str))
+        model_data['kullanim_encoded'] = le_kullanim.fit_transform(model_data['KULLANIM ŞEKLİ'].fillna('Diğer').astype(str))
         
         # Model seçimi
         col1, col2 = st.columns(2)
