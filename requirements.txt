@@ -5,6 +5,3 @@ plotly
 openpyxl
 xlrd
 pyxlsb
-statsmodels
-scikit-learn
-scipy
