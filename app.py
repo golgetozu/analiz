@@ -1,4 +1,4 @@
-import streamlit as st
+mimport streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.express as px
@@ -26,7 +26,7 @@ def check_password():
     """Basit şifre kontrolü"""
     
     def password_entered():
-        if st.session_state["password"] == "sigorta2024":  # ← Buraya kendi şifrenizi yazın
+        if st.session_state["password"] == "Emaa2026":  # ← Buraya kendi şifrenizi yazın
             st.session_state["password_correct"] = True
             del st.session_state["password"]
         else:
