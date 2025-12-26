@@ -9,17 +9,6 @@ import statsmodels.formula.api as smf
 from scipy import stats
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder
-import streamlit as st
-import pandas as pd
-import numpy as np
-import plotly.express as px
-import plotly.graph_objects as go
-from datetime import datetime
-import statsmodels.api as sm
-import statsmodels.formula.api as smf
-from scipy import stats
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import LabelEncoder
 
 # ==================== ŞİFRE KORUMASI ====================
 def check_password():
