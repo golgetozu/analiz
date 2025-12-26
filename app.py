@@ -74,6 +74,11 @@ def load_excel(file):
 
 df_uretim = load_excel(uretim_file)
 df_hasar = load_excel(hasar_file)
+# Orijinal veriyi koru
+if df_uretim is not None:
+    df_uretim = df_uretim.copy()
+if df_hasar is not None:
+    df_hasar = df_hasar.copy()
 
 tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
     "📊 Özet", "🏭 Üretim", "💥 Hasar", "📈 H/P Oranı", 
