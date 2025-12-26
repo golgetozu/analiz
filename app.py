@@ -1,5 +1,5 @@
 import streamlit as st
-st.set_page_config(page_title="Oto Sigorta Analiz", page_icon="🚗", layout="wide")
+st.set_page_config(page_title="InsureA Trafik Analiz", page_icon="🚗", layout="wide")
 
 import pandas as pd
 import numpy as np
