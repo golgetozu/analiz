@@ -32,7 +32,7 @@ if not check_password():
     st.stop()
 # ==================== ŞİFRE KORUMASI BİTTİ ====================
 
-st.title("🚗 Oto Branşı Hasar/Prim Analiz Sistemi")
+st.title("🚗 InsureA Sigortacılık Analiz Sistemi")
 
 # Dosya Yükleme
 st.sidebar.header("📂 Veri Yükle")
